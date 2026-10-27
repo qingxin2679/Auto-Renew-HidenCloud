@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from datetime import datetime
+from pathlib import Path
 try:
     from patchright.sync_api import sync_playwright
     USING_PATCHRIGHT = True
@@ -37,6 +39,87 @@ else:
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
+def dismiss_consent_banner(page):
+    """只操作 ncmp 隐私弹窗，优先拒绝可选 Cookie；不强制穿透遮罩。"""
+    root = page.locator('#ncmp__tool')
+    if not root.is_visible():
+        return True
+    log("🍪 检测到 ncmp 隐私弹窗，正在处理...")
+    try:
+        Path('diagnostics').mkdir(exist_ok=True)
+        root.screenshot(path='diagnostics/consent-banner.png', timeout=5000,
+                        mask=[root.locator('input, textarea')])
+    except Exception:
+        pass  # 截图失败不能阻断续期
+
+    reject = re.compile(
+        r'^(reject( all)?( cookies)?|decline( all)?|deny( all)?|'
+        r'continue without (accepting|agreeing)|do not consent|'
+        r'(accept |allow |use )?(only necessary|necessary only|essential only)( cookies)?|'
+        r'拒绝全部|全部拒绝|拒绝|仅必要|仅使用必要的?\s*Cookie)$', re.I)
+    close = re.compile(r'^(close|dismiss|关闭|關閉)$', re.I)
+    preferences = re.compile(
+        r'^(manage( (options|preferences|cookies|consent))?|'
+        r'(cookie |privacy )?(settings|preferences)|customi[sz]e|'
+        r'more options|管理选项|设置|自定义)$', re.I)
+    opened_preferences = False
+    for _ in range(4):
+        if not root.is_visible():
+            log("✅ 隐私弹窗已关闭")
+            return True
+        controls = root.locator('button:visible, a:visible, [role="button"]:visible, input[type="button"]:visible')
+        clicked = False
+        for pattern, is_preferences in ((reject, False), (close, False), (preferences, True)):
+            if is_preferences and opened_preferences:
+                continue
+            for control in controls.all():
+                label = (control.get_attribute('aria-label') or
+                         control.inner_text() or control.get_attribute('value') or '').strip()
+                if not pattern.fullmatch(label):
+                    continue
+                control.click(timeout=5000)
+                log(f"🍪 隐私弹窗操作: {label}")
+                opened_preferences |= is_preferences
+                clicked = True
+                try:
+                    root.wait_for(state='hidden', timeout=2000)
+                    log("✅ 隐私弹窗已关闭")
+                    return True
+                except Exception:
+                    break
+            if clicked:
+                break
+        if not clicked:
+            break
+    log("❌ 隐私弹窗仍可见，停止点击，详见 consent-banner 截图")
+    return False
+
+def click_with_consent(page, button, timeout=20000):
+    """点击前清理 CMP；仅在明确被 ncmp 拦截时重试，避免重复提交。"""
+    if not dismiss_consent_banner(page):
+        raise RuntimeError('ncmp 隐私弹窗未关闭')
+    try:
+        button.click(timeout=timeout)
+    except Exception as exc:
+        if 'ncmp' not in str(exc) or 'intercepts pointer events' not in str(exc):
+            raise
+        if not dismiss_consent_banner(page):
+            raise RuntimeError('ncmp 隐私弹窗拦截点击') from exc
+        button.click(timeout=timeout)
+
+def due_date_extended(old_due, new_due):
+    try:
+        return datetime.strptime(new_due, '%d %b %Y') > datetime.strptime(old_due, '%d %b %Y')
+    except (ValueError, TypeError):
+        return False
+
+def write_run_summary(status, old_due='未知', new_due='未知'):
+    summary = os.environ.get('GITHUB_STEP_SUMMARY')
+    if summary:
+        with open(summary, 'a', encoding='utf-8') as stream:
+            stream.write(f'### HidenCloud 续期结果\n\n{status}\n\n'
+                         f'| 续期前 | 续期后 |\n| --- | --- |\n| {old_due} | {new_due} |\n\n')
+
 STEALTH_JS = """
 // 注意：使用真实 Chrome（channel="chrome"）时不要覆盖 window.chrome，
 // 否则会丢失 app/csi/loadTimes 等真实特征，反而更容易被 Cloudflare 识别。
@@ -58,7 +141,7 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+def send_telegram_notification(status, old_due="未知", new_due="未知", current_ip="未知"):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
@@ -565,7 +648,7 @@ def renew_service(page):
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
-                renew_btn.click()
+                click_with_consent(page, renew_btn)
                 time.sleep(3) # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
@@ -603,9 +686,11 @@ def renew_service(page):
             log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
             try:
                 create_btn.wait_for(state="visible", timeout=30000)
-                create_btn.click(timeout=20000)
+                click_with_consent(page, create_btn, timeout=20000)
             except Exception as e:
                 log(f"⚠️ 点击 Create Invoice 失败: {e}")
+                if 'ncmp' in str(e):
+                    return False
                 solve_modal_turnstile(page, timeout=45)
                 time.sleep(2)
                 continue
@@ -639,7 +724,7 @@ def renew_service(page):
         log("🔎 查找 Pay 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        click_with_consent(page, pay_btn)
         log("✅ Pay 按钮已点击")
         time.sleep(6) # 等待支付确认页面或跳转回服务页
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000) # 返回服务管理页面以获取新的到期时间
@@ -677,12 +762,14 @@ def main():
             browser, page = open_browser(p)
 
             if not login(page):
+                write_run_summary('❌ 登录失败，未执行续期')
                 sys.exit(1)
 
             # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，退出。")
+                write_run_summary('❌ 无法获取 Server ID，未执行续期')
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
@@ -701,9 +788,22 @@ def main():
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
             else:  # renew_result is True
-                new_due = get_due_date(page)
+                # 等待服务端更新，并核对到期日期确实延长。
+                for check in range(3):
+                    new_due = get_due_date(page)
+                    if due_date_extended(old_due, new_due):
+                        break
+                    if check < 2:
+                        time.sleep(5)
+                        page.reload(wait_until='domcontentloaded', timeout=60000)
                 log(f"📆 续费后到期时间：{new_due}")
-                status = "✅ 续期成功"
+                if due_date_extended(old_due, new_due):
+                    status = "✅ 续期成功（到期日期已延长）"
+                else:
+                    status = "❌ 未确认到期日期延长，请检查服务状态"
+                    renew_result = False
+
+            write_run_summary(status, old_due, new_due)
 
             # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due, current_ip)
@@ -716,6 +816,7 @@ def main():
                 sys.exit(0)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
+            write_run_summary('❌ 脚本异常，详见运行日志')
             sys.exit(1)
         finally:
             if browser:
@@ -726,3 +827,4 @@ def main():
                 
 if __name__ == "__main__":
     main()
+
