@@ -7,7 +7,10 @@ on:
 
 permissions:
   contents: write
-  actions: write
+
+concurrency:
+  group: hiden-renew
+  cancel-in-progress: false
 
 jobs:
   renew-hiden:
@@ -41,6 +44,9 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
+      - name: 🧪 验证弹窗处理与日期核验
+        run: python -m unittest discover -s tests -v
+
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
@@ -50,7 +56,16 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      - name: 📷 保存隐私弹窗诊断截图
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: consent-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics/consent-banner.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # 定期更新仓库，避免长期无活动导致定时工作流暂停
       - name: 🕒 更新时间
         run: |
           git config user.name "github-actions[bot]"
@@ -64,17 +79,4 @@ jobs:
             git push origin main
           fi
       
-      - name: 🧹 清理旧的工作流运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+
