@@ -7,18 +7,38 @@ import re
 import tempfile
 import unittest
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 # 仅加载待测试函数，避免模块级凭证读取、网络依赖或浏览器启动。
 source = Path(__file__).resolve().parents[1] / 'app.py'
-names = {'dismiss_consent_banner', 'click_with_consent', 'due_date_extended', 'write_run_summary'}
+names = {'dismiss_consent_banner', 'click_with_consent', 'due_date_extended', 'write_run_summary',
+         '_extract_authorize_query'}
 tree = ast.parse(source.read_text(encoding='utf-8'))
-scope = dict(datetime=datetime, os=os, Path=Path, re=re, log=lambda message: None)
+scope = dict(datetime=datetime, os=os, Path=Path, re=re, log=lambda message: None,
+             parse_qs=parse_qs, urlsplit=urlsplit, DISCORD_ORIGIN='https://discord.com',
+             DISCORD_CALLBACK_URL='https://dash.hidencloud.com/oauth/discord/redirect')
 exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
                         type_ignores=[]), str(source), 'exec'), scope)
 
 
 class RenewalTests(unittest.TestCase):
+    def test_discord_authorize_redirects(self):
+        query = urlencode({'client_id': 'test', 'state': 'test', 'redirect_uri': scope['DISCORD_CALLBACK_URL']})
+        direct = f'/oauth2/authorize?{query}'
+        login_query = urlencode({'redirect_to': direct})
+        for path in (direct, '/api' + direct, f'/login?{login_query}'):
+            self.assertEqual(scope['_extract_authorize_query']('https://discord.com' + path), query)
+
+    def test_discord_authorize_rejects_unexpected_origin_and_callback(self):
+        extract = scope['_extract_authorize_query']
+        query = urlencode({'state': 'test', 'redirect_uri': scope['DISCORD_CALLBACK_URL']})
+        path = f'/oauth2/authorize?{query}'
+        untrusted_login = urlencode({'redirect_to': 'https://example.com' + path})
+        self.assertEqual(extract('https://discord.com.example.com' + path), '')
+        self.assertEqual(extract(f'https://discord.com/login?{untrusted_login}'), '')
+        self.assertEqual(extract('https://discord.com' + path.replace('dash.hidencloud.com', 'example.com')), '')
+
     def test_later_date(self):
         self.assertTrue(scope['due_date_extended']('28 Oct 2026', '4 Nov 2026'))
 
